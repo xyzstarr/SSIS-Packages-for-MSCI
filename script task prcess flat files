@@ -1,0 +1,229 @@
+using System; 
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using Microsoft.SqlServer.Dts.Runtime;
+
+public class ScriptMain : UserComponent
+{
+    public void Main()
+    {
+        try
+        {
+            // Create an instance of your custom class and execute the file processing task
+            var processor = new PipeDelimitedFileProcessor();
+            processor.ExecuteFileProcessingTask();
+        }
+        catch (Exception ex)
+        {
+            // Log failure and stop the task
+            Dts.Events.FireError(0, "Script Task Error", ex.Message, "", 0);
+            Dts.TaskResult = (int)DTSExecResult.Failure;
+        }
+    }
+}
+
+public class PipeDelimitedFileProcessor
+{
+    private readonly string _dbServer;
+    private readonly string _dbName;
+    private readonly string _vendor;
+    private readonly string _sourceFolder;
+    private readonly string _archiveFolder;
+    private readonly string _errorFolder;
+    private readonly string _tableName;
+    private readonly string _connectionString;
+
+    // Constructor: Initializes class variables from SSIS package variables.
+    public PipeDelimitedFileProcessor()
+    {
+        _dbServer = Dts.Variables["User::DBServer"].Value.ToString();
+        _dbName = Dts.Variables["User::DBName"].Value.ToString();
+        _vendor = Dts.Variables["User::Vendor"].Value.ToString();
+        _sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
+        _archiveFolder = Dts.Variables["User::ArchiveFolder"].Value.ToString();
+        _errorFolder = Dts.Variables["User::ErrorFolder"].Value.ToString();
+        _tableName = Dts.Variables["User::DestTableName"].Value.ToString();
+        _connectionString = $"Server={_dbServer};Database={_dbName};Integrated Security=True;";
+    }
+
+    public void ExecuteFileProcessingTask()
+    {
+        try
+        {
+            // Get list of files to process
+            string[] filesToProcess = GetFilesToProcess();
+
+            foreach (string filePath in filesToProcess)
+            {
+                ProcessAndMoveFile(filePath);
+            }
+
+            Dts.TaskResult = (int)DTSExecResult.Success;
+        }
+        catch (Exception ex)
+        {
+            Dts.Events.FireError(0, "File Processing Error", ex.Message, "", 0);
+            Dts.TaskResult = (int)DTSExecResult.Failure;
+        }
+    }
+
+    private string[] GetFilesToProcess()
+    {
+        return Directory.GetFiles(_sourceFolder, $"{_tableName}_*.txt");
+    }
+
+    private void ProcessAndMoveFile(string filePath)
+    {
+        try
+        {
+            DataTable fileData = LoadDataFromFile(filePath);
+            int rowsInserted = InsertDataIntoDatabase(fileData);
+
+            // Insert metadata and update record count in the MetaData table
+            int metaDataID = InsertMetaData(filePath, rowsInserted);
+            UpdateMetaDataRecordCount(metaDataID, rowsInserted);
+
+            // Insert or update Billing table based on the rows inserted
+            UpdateBillingTable(filePath, rowsInserted);
+
+            ArchiveProcessedFile(filePath);
+        }
+        catch (Exception ex)
+        {
+            Dts.Events.FireError(0, "File Processing Error", ex.Message, "", 0);
+        }
+    }
+
+    private DataTable LoadDataFromFile(string filePath)
+    {
+        DataTable dataTable = CreateEmptyDataTable();
+
+        foreach (var line in File.ReadLines(filePath))
+        {
+            string[] columns = line.Split('|');
+            if (columns.Length == dataTable.Columns.Count)
+            {
+                dataTable.Rows.Add(columns);
+            }
+        }
+
+        return dataTable;
+    }
+
+    private DataTable CreateEmptyDataTable()
+    {
+        DataTable dataTable = new DataTable();
+        string query = $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{_vendor}' AND TABLE_NAME = '{_tableName}'";
+
+        using (SqlConnection conn = new SqlConnection(_connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            using (SqlDataReader reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    dataTable.Columns.Add(reader["COLUMN_NAME"].ToString(), typeof(string));
+                }
+            }
+        }
+
+        return dataTable;
+    }
+
+    private int InsertDataIntoDatabase(DataTable dataTable)
+    {
+        int rowsInserted = 0;
+        string destinationTableName = $"{_vendor}.{_tableName}";
+
+        using (SqlConnection conn = new SqlConnection(_connectionString))
+        {
+            conn.Open();
+            using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
+            {
+                bulkCopy.DestinationTableName = destinationTableName;
+                bulkCopy.WriteToServer(dataTable);
+                rowsInserted = dataTable.Rows.Count;
+            }
+        }
+
+        return rowsInserted;
+    }
+
+    private void ArchiveProcessedFile(string filePath)
+    {
+        string archivedFilePath = Path.Combine(_archiveFolder, Path.GetFileName(filePath));
+        File.Move(filePath, archivedFilePath);
+    }
+
+    // Insert metadata and return MetaDataID
+    public int InsertMetaData(string filePath, int rowsInserted)
+    {
+        using (SqlConnection conn = new SqlConnection(_connectionString))
+        {
+            conn.Open();
+            string ingestFileName = Path.GetFileName(filePath);
+            string ingestDBName = _dbName;
+            string tableName = _tableName;
+
+            using (SqlCommand cmd = new SqlCommand("dbo.spInsertMetaData", conn))
+            {
+                cmd.CommandType = CommandType.StoredProcedure;
+                cmd.Parameters.AddWithValue("@Vendor", _vendor);
+                cmd.Parameters.AddWithValue("@IngestFileName", ingestFileName);
+                cmd.Parameters.AddWithValue("@IngestDBName", ingestDBName);
+                cmd.Parameters.AddWithValue("@OutputFileName", DBNull.Value); // Unused
+                cmd.Parameters.AddWithValue("@TableName", tableName);
+                cmd.Parameters.AddWithValue("@recordcount", rowsInserted);
+
+                object result = cmd.ExecuteScalar();
+                return result != null ? Convert.ToInt32(result) : 0;
+            }
+        }
+    }
+
+    // Update record count in MetaData table
+    public void UpdateMetaDataRecordCount(int metaDataID, int recordCount)
+    {
+        using (SqlConnection conn = new SqlConnection(_connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand("dbo.spUpdateMetadataRecordCount", conn))
+            {
+                cmd.CommandType = CommandType.StoredProcedure;
+                cmd.Parameters.AddWithValue("@MetaDataID", metaDataID);
+                cmd.Parameters.AddWithValue("@RecordCount", recordCount);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    // Update Billing table
+    public void UpdateBillingTable(string filePath, int rowsInserted)
+    {
+        using (SqlConnection conn = new SqlConnection(_connectionString))
+        {
+            conn.Open();
+            string query = "IF EXISTS (SELECT 1 FROM Billing WHERE Vendor = @Vendor AND IngestFileName = @IngestFileName) " +
+                           "BEGIN " +
+                           "UPDATE Billing SET RecordCount = @RecordCount, BillingDate = GETDATE() WHERE Vendor = @Vendor AND IngestFileName = @IngestFileName " +
+                           "END " +
+                           "ELSE " +
+                           "BEGIN " +
+                           "INSERT INTO Billing (Vendor, IngestFileName, RecordCount, BillingDate) " +
+                           "VALUES (@Vendor, @IngestFileName, @RecordCount, GETDATE()) " +
+                           "END";
+
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@Vendor", _vendor);
+                cmd.Parameters.AddWithValue("@IngestFileName", Path.GetFileName(filePath));
+                cmd.Parameters.AddWithValue("@RecordCount", rowsInserted);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+}
+
+
