@@ -9,30 +9,99 @@ public void Main()
         string sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
         string archiveFolder = Dts.Variables["User::ArchiveFolder"].Value.ToString();
         string errorFolder = Dts.Variables["User::ErrorFolder"].Value.ToString();
-        string tableName = Dts.Variables["User::TableName"].Value.ToString();
         string connectionString = $"Server={dbServer};Database={dbName};Integrated Security=True;";
 
-        // Get list of files to process, matching table name and allowing for an optional date suffix
-        string[] filesToProcess = Directory.GetFiles(sourceFolder, $"{tableName}_*.txt")
-                                            .Where(f => IsValidFile(f, tableName)) // Validate the file names
-                                            .ToArray();
+        // Get list of files to process that end with '_YYYYMMDD.txt'
+        string[] filesToProcess = Directory.GetFiles(sourceFolder, "*_????????.txt");
 
         foreach (string filePath in filesToProcess)
         {
             try
             {
-                // Load data from the file
-                DataTable fileData = LoadDataFromFile(filePath, vendor, tableName, connectionString);
+                string fileName = Path.GetFileName(filePath);
+                
+                // Extract the table name by removing the '_YYYYMMDD.txt' suffix
+                int dateIndex = fileName.LastIndexOf('_');
+                if (dateIndex > 0 && fileName.EndsWith(".txt"))
+                {
+                    string tableName = fileName.Substring(0, dateIndex);
 
-                // Insert data into the database
-                int rowsInserted = InsertDataIntoDatabase(fileData, vendor, tableName, connectionString);
+                    // Create a DataTable and load it with data from the file
+                    DataTable dataTable = new DataTable();
+                    string query = $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{vendor}' AND TABLE_NAME = '{tableName}'";
 
-                // Insert metadata and update record count in the MetaData table
-                int metaDataID = InsertMetaData(filePath, rowsInserted, vendor, dbName, tableName, connectionString);
-                UpdateMetaDataRecordCount(metaDataID, rowsInserted, connectionString);
+                    using (SqlConnection conn = new SqlConnection(connectionString))
+                    {
+                        conn.Open();
 
-                // Archive processed file
-                ArchiveProcessedFile(filePath, archiveFolder);
+                        // Retrieve column names from the database to create the DataTable
+                        using (SqlCommand cmd = new SqlCommand(query, conn))
+                        using (SqlDataReader reader = cmd.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                dataTable.Columns.Add(reader["COLUMN_NAME"].ToString(), typeof(string));
+                            }
+                        }
+
+                        // Read the lines from the file and load them into the DataTable
+                        foreach (var line in File.ReadLines(filePath))
+                        {
+                            string[] columns = line.Split('|');
+                            if (columns.Length == dataTable.Columns.Count)
+                            {
+                                dataTable.Rows.Add(columns);
+                            }
+                        }
+
+                        // Insert data into the database
+                        int rowsInserted = 0;
+                        string destinationTableName = $"{vendor}.{tableName}";
+
+                        using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
+                        {
+                            bulkCopy.DestinationTableName = destinationTableName;
+                            bulkCopy.WriteToServer(dataTable);
+                            rowsInserted = dataTable.Rows.Count;
+                        }
+
+                        // Insert metadata and update record count in the MetaData table
+                        string ingestFileName = Path.GetFileName(filePath);
+                        string ingestDBName = dbName;
+                        int metaDataID = 0;
+
+                        using (SqlCommand cmd = new SqlCommand("dbo.spInsertMetaData", conn))
+                        {
+                            cmd.CommandType = CommandType.StoredProcedure;
+                            cmd.Parameters.AddWithValue("@Vendor", vendor);
+                            cmd.Parameters.AddWithValue("@IngestFileName", ingestFileName);
+                            cmd.Parameters.AddWithValue("@IngestDBName", ingestDBName);
+                            cmd.Parameters.AddWithValue("@OutputFileName", DBNull.Value); // Unused
+                            cmd.Parameters.AddWithValue("@TableName", tableName);
+                            cmd.Parameters.AddWithValue("@recordcount", rowsInserted);
+
+                            object result = cmd.ExecuteScalar();
+                            metaDataID = result != null ? Convert.ToInt32(result) : 0;
+                        }
+
+                        // Update record count in MetaData table
+                        using (SqlCommand cmd = new SqlCommand("dbo.spUpdateMetadataRecordCount", conn))
+                        {
+                            cmd.CommandType = CommandType.StoredProcedure;
+                            cmd.Parameters.AddWithValue("@MetaDataID", metaDataID);
+                            cmd.Parameters.AddWithValue("@RecordCount", rowsInserted);
+                            cmd.ExecuteNonQuery();
+                        }
+
+                        // Archive processed file
+                        string archivedFilePath = Path.Combine(archiveFolder, Path.GetFileName(filePath));
+                        File.Move(filePath, archivedFilePath);
+                    }
+                }
+                else
+                {
+                    throw new Exception($"Invalid file name format: {fileName}");
+                }
             }
             catch (Exception ex)
             {
@@ -49,144 +118,5 @@ public void Main()
         // Log any global errors and stop execution
         Dts.Events.FireError(0, "Script Task Error", ex.Message, "", 0);
         Dts.TaskResult = (int)DTSExecResult.Failure;
-    }
-}
-
-private bool IsValidFile(string filePath, string tableName)
-{
-    // Extract the file name from the file path
-    string fileName = Path.GetFileName(filePath);
-    string pattern = $"{tableName}_"; // Check if the filename starts with the table name
-
-    // Ensure that the file starts with the correct pattern
-    if (fileName.StartsWith(pattern) && fileName.Length > pattern.Length)
-    {
-        // Extract the potential date part (last 10 characters, if any)
-        string datePart = fileName.Length >= (pattern.Length + 10) ? fileName.Substring(fileName.Length - 12, 10) : string.Empty;
-        
-        // Check if the date part exists and if it's a valid date (in the format YYYYMMDD)
-        if (!string.IsNullOrEmpty(datePart))
-        {
-            DateTime date;
-            if (DateTime.TryParseExact(datePart, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out date))
-            {
-                return true; // Valid date found, valid file
-            }
-        }
-        else
-        {
-            return true; // Valid file without a date suffix
-        }
-    }
-
-    return false; // Invalid file
-}
-
-private DataTable LoadDataFromFile(string filePath, string vendor, string tableName, string connectionString)
-{
-    DataTable dataTable = CreateEmptyDataTable(vendor, tableName, connectionString);
-
-    // Read the lines from the file and load them into the DataTable
-    foreach (var line in File.ReadLines(filePath))
-    {
-        string[] columns = line.Split('|');
-
-        if (columns.Length == dataTable.Columns.Count)
-        {
-            dataTable.Rows.Add(columns);
-        }
-    }
-
-    return dataTable;
-}
-
-private DataTable CreateEmptyDataTable(string vendor, string tableName, string connectionString)
-{
-    DataTable dataTable = new DataTable();
-    string query = $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{vendor}' AND TABLE_NAME = '{tableName}'";
-
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
-        {
-            while (reader.Read())
-            {
-                dataTable.Columns.Add(reader["COLUMN_NAME"].ToString(), typeof(string));
-            }
-        }
-    }
-
-    return dataTable;
-}
-
-private int InsertDataIntoDatabase(DataTable dataTable, string vendor, string tableName, string connectionString)
-{
-    int rowsInserted = 0;
-    string destinationTableName = $"{vendor}.{tableName}";
-
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-
-        using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
-        {
-            bulkCopy.DestinationTableName = destinationTableName;
-            bulkCopy.WriteToServer(dataTable);
-            rowsInserted = dataTable.Rows.Count;
-        }
-    }
-
-    return rowsInserted;
-}
-
-private void ArchiveProcessedFile(string filePath, string archiveFolder)
-{
-    string archivedFilePath = Path.Combine(archiveFolder, Path.GetFileName(filePath));
-    File.Move(filePath, archivedFilePath);
-}
-
-// Insert metadata and return MetaDataID
-public int InsertMetaData(string filePath, int rowsInserted, string vendor, string dbName, string tableName, string connectionString)
-{
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-
-        string ingestFileName = Path.GetFileName(filePath);
-        string ingestDBName = dbName;
-
-        using (SqlCommand cmd = new SqlCommand("dbo.spInsertMetaData", conn))
-        {
-            cmd.CommandType = CommandType.StoredProcedure;
-            cmd.Parameters.AddWithValue("@Vendor", vendor);
-            cmd.Parameters.AddWithValue("@IngestFileName", ingestFileName);
-            cmd.Parameters.AddWithValue("@IngestDBName", ingestDBName);
-            cmd.Parameters.AddWithValue("@OutputFileName", DBNull.Value); // Unused
-            cmd.Parameters.AddWithValue("@TableName", tableName);
-            cmd.Parameters.AddWithValue("@recordcount", rowsInserted);
-
-            object result = cmd.ExecuteScalar();
-            return result != null ? Convert.ToInt32(result) : 0;
-        }
-    }
-}
-
-// Update record count in MetaData table
-public void UpdateMetaDataRecordCount(int metaDataID, int recordCount, string connectionString)
-{
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-
-        using (SqlCommand cmd = new SqlCommand("dbo.spUpdateMetadataRecordCount", conn))
-        {
-            cmd.CommandType = CommandType.StoredProcedure;
-            cmd.Parameters.AddWithValue("@MetaDataID", metaDataID);
-            cmd.Parameters.AddWithValue("@RecordCount", recordCount);
-            cmd.ExecuteNonQuery();
-        }
     }
 }
