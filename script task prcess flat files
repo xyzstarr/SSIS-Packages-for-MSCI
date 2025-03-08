@@ -107,4 +107,166 @@ public class ScriptMain : UserComponent
 
         using (StreamReader reader = new StreamReader(filePath))
         {
-            st
+            string line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                string[] columns = line.Split('|');
+
+                if (columns.Length == dataTable.Columns.Count)
+                {
+                    DataRow row = dataTable.NewRow();
+                    for (int i = 0; i < columns.Length; i++)
+                    {
+                        row[i] = columns[i];
+                    }
+                    dataTable.Rows.Add(row);
+                }
+                else
+                {
+                    Dts.Events.FireError(0, "Column Mismatch", "Number of columns in file does not match the table schema.", "", 0);
+                }
+            }
+        }
+
+        // Log the number of rows loaded
+        Dts.Events.FireInformation(0, "Rows Loaded", $"{dataTable.Rows.Count} rows loaded from file: {filePath}", "", 0, ref fireAgain: false);
+
+        return dataTable;
+    }
+
+    private DataTable CreateEmptyDataTable(string vendor, string tableName, string connectionString)
+    {
+        DataTable dataTable = new DataTable();
+
+        string query = $"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{vendor}' AND TABLE_NAME = '{tableName}'";
+
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            using (SqlDataReader reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    dataTable.Columns.Add(reader["COLUMN_NAME"].ToString(), typeof(string));
+                }
+            }
+        }
+
+        return dataTable;
+    }
+
+    private int InsertDataIntoDatabase(DataTable dataTable, string vendor, string tableName, string connectionString)
+    {
+        int rowsInserted = 0;
+        string destinationTableName = $"{vendor}.{tableName}";
+
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+
+            using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
+            {
+                bulkCopy.DestinationTableName = destinationTableName;
+
+                // Map columns by name instead of by index
+                foreach (DataColumn dataColumn in dataTable.Columns)
+                {
+                    bulkCopy.ColumnMappings.Add(dataColumn.ColumnName, dataColumn.ColumnName);
+                }
+
+                bulkCopy.BatchSize = 10000;
+
+                try
+                {
+                    bulkCopy.WriteToServer(dataTable);
+                    rowsInserted = dataTable.Rows.Count;
+                }
+                catch (Exception ex)
+                {
+                    Dts.Events.FireError(0, "Bulk Copy Error", ex.Message, "", 0);
+                }
+            }
+        }
+
+        return rowsInserted;
+    }
+
+    private void ArchiveProcessedFile(string filePath, string archiveFolder)
+    {
+        string archivedFilePath = Path.Combine(archiveFolder, Path.GetFileName(filePath));
+        File.Move(filePath, archivedFilePath);
+    }
+
+    // Insert metadata and return MetaDataID
+    public int InsertMetaData(string filePath, int rowsInserted, string vendor, string dbName, string tableName, string connectionString)
+    {
+        int metaDataID = 0;
+        try
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+
+                string ingestFileName = Path.GetFileName(filePath);
+                string ingestDBName = dbName;
+
+                using (SqlCommand cmd = new SqlCommand("dbo.spInsertMetaData", conn))
+                {
+                    cmd.CommandType = CommandType.StoredProcedure;
+
+                    cmd.Parameters.AddWithValue("@Vendor", vendor);
+                    cmd.Parameters.AddWithValue("@IngestFileName", ingestFileName);
+                    cmd.Parameters.AddWithValue("@IngestDBName", ingestDBName);
+                    cmd.Parameters.AddWithValue("@OutputFileName", DBNull.Value);
+                    cmd.Parameters.AddWithValue("@TableName", tableName);
+                    cmd.Parameters.AddWithValue("@recordcount", rowsInserted);
+
+                    object result = cmd.ExecuteScalar();
+                    if (result != null)
+                    {
+                        metaDataID = Convert.ToInt32(result);
+                    }
+                    else
+                    {
+                        Dts.Events.FireError(0, "MetaData Insert Error", "Stored procedure did not return a valid MetaDataID.", "", 0);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Dts.Events.FireError(0, "MetaData Insert Exception", ex.Message, "", 0);
+        }
+
+        return metaDataID;
+    }
+
+    // Update record count in MetaData table
+    public void UpdateMetaDataRecordCount(int metaDataID, int recordCount, string connectionString)
+    {
+        try
+        {
+            using (SqlConnection conn = new SqlConnection(connectionString))
+            {
+                conn.Open();
+
+                using (SqlCommand cmd = new SqlCommand("dbo.spUpdateMetadataRecordCount", conn))
+                {
+                    cmd.CommandType = CommandType.StoredProcedure;
+
+                    cmd.Parameters.AddWithValue("@MetaDataID", metaDataID);
+                    cmd.Parameters.AddWithValue("@RecordCount", recordCount);
+
+                    cmd.ExecuteNonQuery();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Dts.Events.FireError(0, "MetaData Update Error", ex.Message, "", 0);
+        }
+    }
+}
+
