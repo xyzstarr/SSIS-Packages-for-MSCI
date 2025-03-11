@@ -11,9 +11,9 @@ public void Main()
         string errorFolder = Dts.Variables["User::ErrorFolder"].Value.ToString();
         string connectionString = $"Server={dbServer};Database={dbName};Integrated Security=True;";
 
-        // Get list of files to process that end with '_YYYYMMDD.txt'
+        // Get list of files to process that end with '_YYYYMMDD.txt' or '_YYYYMMDD.csv'
         string[] allFiles = Directory.GetFiles(sourceFolder);
-        string pattern = @"^[\w\d]+_\d{8}\.txt$"; // Updated regex pattern to match files starting with alphanumeric characters and ending with '_YYYYMMDD.txt'
+        string pattern = @"^[\w\d]+_\d{8}\.(txt|csv)$"; // Updated regex pattern to match files ending with '_YYYYMMDD.txt' or '_YYYYMMDD.csv'
         var regex = new Regex(pattern);
         var filesToProcess = allFiles.Where(file => regex.IsMatch(Path.GetFileName(file))).ToArray();
 
@@ -30,11 +30,14 @@ public void Main()
                     throw new Exception($"Invalid file path: {filePath}");
                 }
 
-                // Extract the table name by removing the '_YYYYMMDD.txt' suffix
+                // Extract the table name by removing the '_YYYYMMDD.txt' or '_YYYYMMDD.csv' suffix
                 int dateIndex = fileName.LastIndexOf('_');
-                if (dateIndex > 0 && fileName.EndsWith(".txt"))
+                if (dateIndex > 0 && (fileName.EndsWith(".txt") || fileName.EndsWith(".csv")))
                 {
                     string tableName = fileName.Substring(0, dateIndex);
+
+                    // Determine the delimiter based on the file extension
+                    char delimiter = fileName.EndsWith(".txt") ? '|' : ',';
 
                     // Create a DataTable and load it with data from the file
                     DataTable dataTable = new DataTable();
@@ -127,7 +130,7 @@ public void Main()
                         if (lines.Count > 0)
                         {
                             // First line contains column names
-                            string[] fileColumns = lines[0].Split('|');
+                            string[] fileColumns = lines[0].Split(delimiter);
                             Dictionary<string, int> fileColumnIndexMapping = new Dictionary<string, int>();
                             for (int i = 0; i < fileColumns.Length; i++)
                             {
@@ -137,7 +140,7 @@ public void Main()
                             // Read the remaining lines and load them into the DataTable
                             for (int i = 1; i < lines.Count; i++)
                             {
-                                string[] columns = lines[i].Split('|');
+                                string[] columns = lines[i].Split(delimiter);
                                 DataRow row = dataTable.NewRow();
                                 foreach (DataColumn column in dataTable.Columns)
                                 {
