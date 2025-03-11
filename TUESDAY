@@ -1,0 +1,234 @@
+public void Main()
+{
+    try
+    {
+        // Get the SSIS package variables
+        string dbServer = Dts.Variables["User::DBServer"].Value.ToString();
+        string dbName = Dts.Variables["User::DBName"].Value.ToString();
+        string vendor = Dts.Variables["User::Vendor"].Value.ToString();
+        string sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
+        string archiveFolder = Dts.Variables["User::ArchiveFolder"].Value.ToString();
+        string errorFolder = Dts.Variables["User::ErrorFolder"].ToString();
+        string connectionString = $"Server={dbServer};Database={dbName};Integrated Security=True;";
+
+        // Get list of files to process that end with '_YYYYMMDD.txt'
+        string[] allFiles = Directory.GetFiles(sourceFolder);
+        string pattern = @"^\d+_[A-Z_]+_\d{8}\.txt$"; // Updated regex pattern to match files with numeric prefix
+        var regex = new Regex(pattern);
+        var filesToProcess = allFiles.Where(file => regex.IsMatch(Path.GetFileName(file))).ToArray();
+
+        // Loop through each file in the list of files to process
+        foreach (string filePath in filesToProcess)
+        {
+            try
+            {
+                string fileName = Path.GetFileName(filePath);
+
+                // Validate the file path to prevent path-injection vulnerabilities
+                if (!filePath.StartsWith(sourceFolder) || fileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                {
+                    throw new Exception($"Invalid file path: {filePath}");
+                }
+
+                // Extract the table name by removing the numeric prefix and '_YYYYMMDD.txt' suffix
+                int firstUnderscoreIndex = fileName.IndexOf('_');
+                int dateIndex = fileName.LastIndexOf('_');
+                if (firstUnderscoreIndex > 0 && dateIndex > firstUnderscoreIndex && fileName.EndsWith(".txt"))
+                {
+                    string tableName = fileName.Substring(firstUnderscoreIndex + 1, dateIndex - firstUnderscoreIndex - 1);
+
+                    // Create a DataTable and load it with data from the file
+                    DataTable dataTable = new DataTable();
+                    string query = $"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{vendor}' AND TABLE_NAME = '{tableName}'";
+
+                    using (SqlConnection conn = new SqlConnection(connectionString))
+                    {
+                        conn.Open();
+
+                        // Retrieve column names and data types from the database to create the DataTable
+                        Dictionary<string, Type> columnTypeMapping = new Dictionary<string, Type>();
+                        using (SqlCommand cmd = new SqlCommand(query, conn))
+                        using (SqlDataReader reader = cmd.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                string columnName = reader["COLUMN_NAME"].ToString();
+                                string dataType = reader["DATA_TYPE"].ToString();
+                                Type columnType = typeof(string); // Default to string
+
+                                // Map SQL data types to .NET types
+                                switch (dataType.ToLower())
+                                {
+                                    case "int":
+                                        columnType = typeof(int);
+                                        break;
+                                    case "bigint":
+                                        columnType = typeof(long);
+                                        break;
+                                    case "smallint":
+                                        columnType = typeof(short);
+                                        break;
+                                    case "tinyint":
+                                        columnType = typeof(byte);
+                                        break;
+                                    case "bit":
+                                        columnType = typeof(bool);
+                                        break;
+                                    case "decimal":
+                                    case "numeric":
+                                        columnType = typeof(decimal);
+                                        break;
+                                    case "float":
+                                        columnType = typeof(double);
+                                        break;
+                                    case "real":
+                                        columnType = typeof(float);
+                                        break;
+                                    case "datetime":
+                                    case "smalldatetime":
+                                    case "date":
+                                    case "time":
+                                    case "datetime2":
+                                    case "datetimeoffset":
+                                        columnType = typeof(DateTime);
+                                        break;
+                                    case "char":
+                                    case "varchar":
+                                    case "text":
+                                    case "nchar":
+                                    case "nvarchar":
+                                    case "ntext":
+                                        columnType = typeof(string);
+                                        break;
+                                    case "binary":
+                                    case "varbinary":
+                                    case "image":
+                                        columnType = typeof(byte[]);
+                                        break;
+                                    case "uniqueidentifier":
+                                        columnType = typeof(Guid);
+                                        break;
+                                    case "xml":
+                                        columnType = typeof(string);
+                                        break;
+                                    case "sql_variant":
+                                        columnType = typeof(object);
+                                        break;
+                                    // Add more type mappings as needed
+                                }
+
+                                // Add the column to the DataTable
+                                dataTable.Columns.Add(columnName, columnType);
+                                columnTypeMapping[columnName] = columnType;
+                            }
+                        }
+
+                        // Read the lines from the file and load them into the DataTable
+                        var lines = File.ReadLines(filePath).ToList();
+                        if (lines.Count > 0)
+                        {
+                            // First line contains column names
+                            string[] fileColumns = lines[0].Split('|');
+                            Dictionary<string, int> fileColumnIndexMapping = new Dictionary<string, int>();
+                            for (int i = 0; i < fileColumns.Length; i++)
+                            {
+                                fileColumnIndexMapping[fileColumns[i]] = i;
+                            }
+
+                            // Read the remaining lines and load them into the DataTable
+                            for (int i = 1; i < lines.Count; i++)
+                            {
+                                string[] columns = lines[i].Split('|');
+                                DataRow row = dataTable.NewRow();
+                                foreach (DataColumn column in dataTable.Columns)
+                                {
+                                    if (fileColumnIndexMapping.ContainsKey(column.ColumnName))
+                                    {
+                                        int columnIndex = fileColumnIndexMapping[column.ColumnName];
+                                        row[column.ColumnName] = Convert.ChangeType(columns[columnIndex], columnTypeMapping[column.ColumnName]);
+                                    }
+                                }
+                                dataTable.Rows.Add(row);
+                            }
+                        }
+
+                        // Insert data into the database
+                        int rowsInserted = 0;
+                        string destinationTableName = $"{vendor}.{tableName}";
+
+                        using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
+                        {
+                            bulkCopy.DestinationTableName = destinationTableName;
+                            bulkCopy.WriteToServer(dataTable);
+                            rowsInserted = dataTable.Rows.Count;
+                        }
+
+                        // Insert metadata and update record count in the MetaData table
+                        string ingestFileName = Path.GetFileName(filePath);
+                        string ingestDBName = dbName;
+                        int metaDataID = 0;
+
+                        using (SqlCommand cmd = new SqlCommand("dbo.spInsertMetaData", conn))
+                        {
+                            cmd.CommandType = CommandType.StoredProcedure;
+                            cmd.Parameters.AddWithValue("@Vendor", vendor);
+                            cmd.Parameters.AddWithValue("@IngestFileName", ingestFileName);
+                            cmd.Parameters.AddWithValue("@IngestDBName", ingestDBName);
+                            cmd.Parameters.AddWithValue("@OutputFileName", DBNull.Value); // Unused
+                            cmd.Parameters.AddWithValue("@TableName", tableName);
+                            cmd.Parameters.AddWithValue("@recordcount", rowsInserted);
+
+                            object result = cmd.ExecuteScalar();
+                            metaDataID = result != null ? Convert.ToInt32(result) : 0;
+                        }
+
+                        // Update record count in MetaData table
+                        using (SqlCommand cmd = new SqlCommand("dbo.spUpdateMetadataRecordCount", conn))
+                        {
+                            cmd.CommandType = CommandType.StoredProcedure;
+                            cmd.Parameters.AddWithValue("@MetaDataID", metaDataID);
+                            cmd.Parameters.AddWithValue("@RecordCount", rowsInserted);
+                            cmd.ExecuteNonQuery();
+                        }
+
+                        // Archive processed file
+                        string archivedFilePath = Path.Combine(archiveFolder, Path.GetFileName(filePath));
+                        if (!archivedFilePath.StartsWith(archiveFolder))
+                        {
+                            throw new Exception($"Invalid archive file path: {archivedFilePath}");
+                        }
+                        File.Copy(filePath, archivedFilePath, true); // Copy file to archive folder, overwrite if exists
+                        File.Delete(filePath); // Delete original file after copying
+                    }
+                }
+                else
+                {
+                    throw new Exception($"Invalid file name format: {fileName}");
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log error if any issues occur while processing the file
+                Dts.Events.FireError(0, "File Processing Error", ex.Message, "", 0);
+
+                // Move file to error folder
+                string errorFilePath = Path.Combine(errorFolder, Path.GetFileName(filePath));
+                if (!errorFilePath.StartsWith(errorFolder))
+                {
+                    throw new Exception($"Invalid error file path: {errorFilePath}");
+                }
+                File.Copy(filePath, errorFilePath, true); // Copy file to error folder, overwrite if exists
+                File.Delete(filePath); // Delete original file after copying
+            }
+        }
+
+        // Mark the task as successful
+        Dts.TaskResult = (int)DTSExecResult.Success;
+    }
+    catch (Exception ex)
+    {
+        // Log any global errors and stop execution
+        Dts.Events.FireError(0, "Script Task Error", ex.Message, "", 0);
+        Dts.TaskResult = (int)DTSExecResult.Failure;
+    }
+}
