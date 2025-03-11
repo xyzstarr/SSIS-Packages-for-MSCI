@@ -8,12 +8,12 @@ public void Main()
         string vendor = Dts.Variables["User::Vendor"].Value.ToString();
         string sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
         string archiveFolder = Dts.Variables["User::ArchiveFolder"].Value.ToString();
-        string errorFolder = Dts.Variables["User::ErrorFolder"].ToString();
+        string errorFolder = Dts.Variables["User::ErrorFolder"].Value.ToString();
         string connectionString = $"Server={dbServer};Database={dbName};Integrated Security=True;";
 
         // Get list of files to process that end with '_YYYYMMDD.txt'
         string[] allFiles = Directory.GetFiles(sourceFolder);
-        string pattern = @"^\d+_[A-Z_]+_\d{8}\.txt$"; // Updated regex pattern to match files with numeric prefix
+        string pattern = @"^[\w\d]+_\d{8}\.txt$"; // Updated regex pattern to match files starting with alphanumeric characters and ending with '_YYYYMMDD.txt'
         var regex = new Regex(pattern);
         var filesToProcess = allFiles.Where(file => regex.IsMatch(Path.GetFileName(file))).ToArray();
 
@@ -30,12 +30,11 @@ public void Main()
                     throw new Exception($"Invalid file path: {filePath}");
                 }
 
-                // Extract the table name by removing the numeric prefix and '_YYYYMMDD.txt' suffix
-                int firstUnderscoreIndex = fileName.IndexOf('_');
+                // Extract the table name by removing the '_YYYYMMDD.txt' suffix
                 int dateIndex = fileName.LastIndexOf('_');
-                if (firstUnderscoreIndex > 0 && dateIndex > firstUnderscoreIndex && fileName.EndsWith(".txt"))
+                if (dateIndex > 0 && fileName.EndsWith(".txt"))
                 {
-                    string tableName = fileName.Substring(firstUnderscoreIndex + 1, dateIndex - firstUnderscoreIndex - 1);
+                    string tableName = fileName.Substring(0, dateIndex);
 
                     // Create a DataTable and load it with data from the file
                     DataTable dataTable = new DataTable();
