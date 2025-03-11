@@ -147,7 +147,26 @@ public void Main()
                                     if (fileColumnIndexMapping.ContainsKey(column.ColumnName))
                                     {
                                         int columnIndex = fileColumnIndexMapping[column.ColumnName];
-                                        row[column.ColumnName] = Convert.ChangeType(columns[columnIndex], columnTypeMapping[column.ColumnName]);
+                                        string columnValue = columns[columnIndex];
+
+                                        // Check if the column value is empty or null
+                                        if (string.IsNullOrEmpty(columnValue))
+                                        {
+                                            row[column.ColumnName] = DBNull.Value;
+                                        }
+                                        else
+                                        {
+                                            try
+                                            {
+                                                row[column.ColumnName] = Convert.ChangeType(columnValue, columnTypeMapping[column.ColumnName]);
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                // Log the error and set the value to DBNull
+                                                Dts.Events.FireError(0, "Data Conversion Error", $"Error converting column '{column.ColumnName}' with value '{columnValue}': {ex.Message}", "", 0);
+                                                row[column.ColumnName] = DBNull.Value;
+                                            }
+                                        }
                                     }
                                 }
                                 dataTable.Rows.Add(row);
