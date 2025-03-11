@@ -41,7 +41,7 @@ public void Main()
 
                     // Create a DataTable and load it with data from the file
                     DataTable dataTable = new DataTable();
-                    string query = $"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{vendor}' AND TABLE_NAME = '[{tableName}]'";
+                    string query = $"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{vendor}' AND TABLE_NAME = '{tableName}'";
 
                     using (SqlConnection conn = new SqlConnection(connectionString))
                     {
@@ -173,9 +173,19 @@ public void Main()
                             }
                         }
 
+                        // Determine the destination table or view name
+                        string destinationTableName;
+                        if (char.IsDigit(tableName[0]))
+                        {
+                            destinationTableName = $"[{vendor}].[vw_{tableName}]";
+                        }
+                        else
+                        {
+                            destinationTableName = $"[{vendor}].[{tableName}]";
+                        }
+
                         // Insert data into the database
                         int rowsInserted = 0;
-                        string destinationTableName = $"[{vendor}].[{tableName}]";
 
                         using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
                         {
